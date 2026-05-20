@@ -392,7 +392,7 @@ if __name__ == '__main__':
     BATCH_MODE = False
     # 批量模式：年份范围
     START_YEAR = 2020
-    END_YEAR = 2023
+    END_YEAR = 2024
     
     # ==================== 执行逻辑 ====================
     

@@ -13,10 +13,13 @@ import logging
 import os
 import re
 import warnings
+import webbrowser
+import wsgiref.simple_server
+import wsgiref.util
 from dataclasses import dataclass
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import pandas as pd
 import pdfplumber
@@ -36,6 +39,21 @@ try:
 except ImportError:
     PDFMINER_AVAILABLE = False
     logging.warning("pdfminer.six not installed. Install with: pip install pdfminer.six")
+
+# Google Drive API (OAuth)
+try:
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    GDRIVE_AVAILABLE = True
+except ImportError:
+    GDRIVE_AVAILABLE = False
+    logging.warning(
+        "Google Drive libraries not installed. "
+        "Install with: pip install google-api-python-client google-auth-oauthlib google-auth-httplib2"
+    )
 
 # 抑制pdfplumber的CropBox警告
 warnings.filterwarnings('ignore', message='.*CropBox.*')
@@ -59,6 +77,164 @@ class ConverterConfig:
     timeout: int = 15  # 请求超时时间（秒）
     chunk_size: int = 8192  # 下载块大小
     processes: Optional[int] = None  # 进程数，None表示自动
+    # Google Drive (OAuth)：仅当 upload_to_gdrive=True 时生效
+    upload_to_gdrive: bool = False
+    delete_local_after_upload: bool = True  # 上传成功后删除本地 PDF 与 TXT
+    gdrive_folder_id: str = ""
+    gdrive_credentials_path: str = ""
+    gdrive_token_path: str = "token.json"
+    upload_record_file: str = "uploaded_txt_records.txt"  # 本地上传完成记录（每行一个 txt 文件名）
+
+
+# Google Drive OAuth scope（仅访问通过本应用创建/打开的文件）
+GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+# 固定端口避免 redirect_uri 与 Console 不一致导致 400；在 Console 已授权重定向 URI 中添加 http://localhost:8080/
+_GDRIVE_OAUTH_PORT = 8080
+_DEBUG_LOG_PATH = "/Users/evawang/Desktop/RA-ZY/Annualreport_tools/.cursor/debug.log"
+
+
+class _OAuthRedirectWSGIApp:
+    """WSGI app 记录回调 URI，不修改 http/https。"""
+    def __init__(self, success_message: str):
+        self.success_message = success_message
+        self.last_request_uri = None
+
+    def __call__(self, environ, start_response):
+        start_response("200 OK", [("Content-type", "text/plain; charset=utf-8")])
+        self.last_request_uri = wsgiref.util.request_uri(environ)
+        return [self.success_message.encode("utf-8")]
+
+
+def _run_local_server_avoid_https_redirect(flow: Any, port: int) -> Any:
+    """与 run_local_server 相同，但 fetch_token 时不再把 http 改成 https，避免 redirect_uri 不一致导致 400。"""
+    success_message = "认证完成，可关闭此页面。"
+    wsgi_app = _OAuthRedirectWSGIApp(success_message)
+    local_server = wsgiref.simple_server.make_server("localhost", port, wsgi_app)
+    flow.redirect_uri = "http://localhost:{}/".format(local_server.server_port)
+    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+    # #region agent log
+    _debug_log("auth URL generated", {"url_preview": auth_url[:350] if auth_url else None, "redirect_uri": flow.redirect_uri}, "H5")
+    # #endregion
+    webbrowser.open(auth_url, new=1, autoraise=True)
+    logging.info("请在浏览器中完成授权，若看到 400 请查看上方日志中的 auth URL 与 Console 配置是否一致")
+    local_server.handle_request()
+    if not wsgi_app.last_request_uri:
+        raise RuntimeError("未收到授权回调，请重试")
+    # 不把 http 改为 https，保持与授权请求中的 redirect_uri 一致。
+    # oauthlib 默认拒绝 http 回调，这里仅对 localhost 授权流程临时放开。
+    old_insecure_transport = os.environ.get("OAUTHLIB_INSECURE_TRANSPORT")
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    # #region agent log
+    _debug_log(
+        "setting OAUTHLIB_INSECURE_TRANSPORT",
+        {"value": "1", "old_value": old_insecure_transport},
+        "H6",
+    )
+    # #endregion
+    try:
+        flow.fetch_token(authorization_response=wsgi_app.last_request_uri)
+    finally:
+        if old_insecure_transport is None:
+            os.environ.pop("OAUTHLIB_INSECURE_TRANSPORT", None)
+        else:
+            os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = old_insecure_transport
+    return flow.credentials
+
+
+def _debug_log(message: str, data: dict, hypothesis_id: str) -> None:
+    import json
+    try:
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"message": message, "data": data, "hypothesisId": hypothesis_id, "timestamp": __import__("time").time()}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _get_gdrive_service(credentials_path: str, token_path: str) -> Any:
+    """使用 OAuth 构建 Drive API 服务。无 token 时打开浏览器完成授权并保存 token。"""
+    # #region agent log
+    _debug_log("_get_gdrive_service entry", {"credentials_path": credentials_path, "token_path": token_path, "token_exists": os.path.exists(token_path), "gdrive_available": GDRIVE_AVAILABLE}, "H1")
+    # #endregion
+    if not GDRIVE_AVAILABLE:
+        raise RuntimeError("Google Drive 库未安装，无法上传")
+    creds = None
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, GDRIVE_SCOPES)
+    # #region agent log
+    _debug_log("after load token", {"creds_is_none": creds is None, "creds_valid": getattr(creds, "valid", None) if creds else None}, "H3")
+    # #endregion
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists(credentials_path):
+                raise FileNotFoundError(f"OAuth 客户端密钥不存在: {credentials_path}")
+            # #region agent log
+            _debug_log("starting OAuth flow", {"redirect_uri_will_be": f"http://localhost:{_GDRIVE_OAUTH_PORT}/", "hint": "Add this exact URI in Google Cloud Console > Credentials > OAuth client > Authorized redirect URIs"}, "H5")
+            # #endregion
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, GDRIVE_SCOPES)
+            try:
+                creds = _run_local_server_avoid_https_redirect(flow, _GDRIVE_OAUTH_PORT)
+            except Exception as e:
+                # #region agent log
+                _debug_log("run_local_server exception", {"type": type(e).__name__, "message": str(e)}, "H2")
+                # #endregion
+                raise
+            # #region agent log
+            _debug_log("OAuth flow completed", {"creds_got": creds is not None}, "H4")
+            # #endregion
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+    return build("drive", "v3", credentials=creds)
+
+
+def _upload_file_to_gdrive(
+    service: Any,
+    local_path: str,
+    parent_folder_id: str,
+    drive_name: Optional[str] = None,
+) -> bool:
+    """上传本地文件到 Drive 指定文件夹。成功返回 True。"""
+    if not os.path.exists(local_path):
+        logging.error(f"上传失败，文件不存在: {local_path}")
+        return False
+    name = drive_name or os.path.basename(local_path)
+    try:
+        media = MediaFileUpload(local_path, resumable=True)
+        service.files().create(
+            body={"name": name, "parents": [parent_folder_id]},
+            media_body=media,
+            fields="id",
+        ).execute()
+        logging.info(f"已上传到 Drive: {name}")
+        return True
+    except Exception as e:
+        logging.error(f"上传到 Drive 失败 {local_path}: {e}")
+        return False
+
+
+def _gdrive_txt_exists(service: Any, parent_folder_id: str, drive_name: str) -> bool:
+    """检查目标 Drive 文件夹中是否已存在同名文件。"""
+    safe_name = drive_name.replace("'", "\\'")
+    query = (
+        f"name = '{safe_name}' and "
+        f"'{parent_folder_id}' in parents and "
+        "trashed = false"
+    )
+    try:
+        resp = service.files().list(
+            q=query,
+            fields="files(id,name)",
+            pageSize=1,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+        files = resp.get("files", [])
+        return len(files) > 0
+    except Exception as e:
+        logging.warning(f"查询 Drive 同名文件失败，将继续尝试上传: {e}")
+        return False
 
 
 class PDFDownloader:
@@ -166,6 +342,39 @@ class PDFConverter:
             timeout=config.timeout,
             chunk_size=config.chunk_size
         )
+        self._drive_service: Any = None
+        self._gdrive_folder_id: str = ""
+        self._uploaded_records: set[str] = set()
+        self._upload_record_path = Path(self.config.upload_record_file)
+        self._load_uploaded_records()
+    
+    def set_drive_service(self, service: Any, folder_id: str) -> None:
+        """注入 Drive API 服务与目标文件夹 ID（上传到 Drive 时由 Processor 调用）。"""
+        self._drive_service = service
+        self._gdrive_folder_id = folder_id
+
+    def _load_uploaded_records(self) -> None:
+        """读取本地上传记录文件。"""
+        if not self._upload_record_path.exists():
+            return
+        try:
+            with open(self._upload_record_path, "r", encoding="utf-8") as f:
+                self._uploaded_records = {line.strip() for line in f if line.strip()}
+            logging.info(f"已加载上传记录: {self._upload_record_path} ({len(self._uploaded_records)} 条)")
+        except OSError as e:
+            logging.warning(f"读取上传记录失败: {e}")
+
+    def _mark_uploaded_record(self, txt_name: str) -> None:
+        """写入本地上传记录（去重）。"""
+        if txt_name in self._uploaded_records:
+            return
+        self._uploaded_records.add(txt_name)
+        try:
+            self._upload_record_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._upload_record_path, "a", encoding="utf-8") as f:
+                f.write(txt_name + "\n")
+        except OSError as e:
+            logging.warning(f"写入上传记录失败: {e}")
     
     @staticmethod
     def _sanitize_filename(filename: str) -> str:
@@ -266,15 +475,15 @@ class PDFConverter:
     
     def process_single_file(
         self,
-        code: int,
+        code: Any,
         name: str,
-        year: int,
+        year: Any,
         pdf_url: str
     ) -> bool:
-        """处理单个文件的下载和转换。
+        """处理单个文件的下载和转换；若启用则上传到 Drive 并可选删除本地文件。
         
         Args:
-            code: 公司代码
+            code: 公司代码（int 或 Excel 读出的类型）
             name: 公司简称
             year: 年份
             pdf_url: PDF下载链接
@@ -282,14 +491,20 @@ class PDFConverter:
         Returns:
             处理是否成功
         """
-        # 生成文件名
-        base_name = self._sanitize_filename(f"{code:06}_{name}_{year}")
+        code_int = int(code) if not isinstance(code, int) else code
+        base_name = self._sanitize_filename(f"{code_int:06d}_{name}_{year}")
         pdf_file_path = os.path.join(self.config.pdf_dir, f"{base_name}.pdf")
         txt_file_path = os.path.join(self.config.txt_dir, f"{base_name}.txt")
+        txt_name = os.path.basename(txt_file_path)
         
         try:
-            # 检查TXT是否已存在
-            if os.path.exists(txt_file_path):
+            # 已在本地上传记录中：直接跳过
+            if self.config.upload_to_gdrive and txt_name in self._uploaded_records:
+                logging.info(f"本地记录显示已上传，跳过: {txt_name}")
+                return True
+
+            # 检查TXT是否已存在（且未开启上传时，存在即跳过；开启上传时若本地无则需下载转换后上传）
+            if os.path.exists(txt_file_path) and not self.config.upload_to_gdrive:
                 logging.info(f"文件已存在，跳过: {base_name}.txt")
                 return True
             
@@ -302,18 +517,44 @@ class PDFConverter:
             if not self._convert_pdf_to_txt(pdf_file_path, txt_file_path):
                 return False
             
-            # 删除PDF（如果配置要求）
-            if self.config.delete_pdf and os.path.exists(pdf_file_path):
-                try:
-                    os.remove(pdf_file_path)
-                    logging.info(f"已删除PDF: {pdf_file_path}")
-                except OSError as e:
-                    logging.warning(f"删除PDF失败: {e}")
+            if self.config.upload_to_gdrive and self._drive_service and self._gdrive_folder_id:
+                # 上传到 Drive：仅上传 TXT（不上传 PDF）
+                drive_txt_name = txt_name
+                if _gdrive_txt_exists(self._drive_service, self._gdrive_folder_id, drive_txt_name):
+                    logging.info(f"Drive 已存在同名 TXT，跳过上传: {drive_txt_name}")
+                    txt_ok = True
+                else:
+                    txt_ok = _upload_file_to_gdrive(
+                        self._drive_service,
+                        txt_file_path,
+                        self._gdrive_folder_id,
+                        drive_txt_name,
+                    )
+                if not txt_ok:
+                    logging.warning(f"TXT 上传失败，保留本地文件: {base_name}")
+                    return False
+                self._mark_uploaded_record(drive_txt_name)
+                if self.config.delete_local_after_upload:
+                    for p in (txt_file_path, pdf_file_path):
+                        if os.path.exists(p):
+                            try:
+                                os.remove(p)
+                                logging.info(f"已删除本地: {p}")
+                            except OSError as e:
+                                logging.warning(f"删除本地文件失败: {e}")
+            else:
+                # 未启用上传：按原逻辑可选删除 PDF
+                if self.config.delete_pdf and os.path.exists(pdf_file_path):
+                    try:
+                        os.remove(pdf_file_path)
+                        logging.info(f"已删除PDF: {pdf_file_path}")
+                    except OSError as e:
+                        logging.warning(f"删除PDF失败: {e}")
             
             return True
             
         except Exception as e:
-            logging.error(f"处理文件失败 {code:06}_{name}_{year}: {e}")
+            logging.error(f"处理文件失败 {code_int:06d}_{name}_{year}: {e}")
             return False
 
 
@@ -371,11 +612,14 @@ class AnnualReportProcessor:
         return filtered
     
     def run(self) -> None:
-        """执行批量处理流程。"""
+        """执行批量处理流程。启用上传时单进程顺序执行以避免 OAuth token 并发。"""
         logging.info("="*60)
         logging.info("年报批量下载转换程序启动")
         logging.info(f"目标年份: {self.config.target_year}")
         logging.info(f"删除PDF: {self.config.delete_pdf}")
+        logging.info(f"上传到 Google Drive: {self.config.upload_to_gdrive}")
+        if self.config.upload_to_gdrive:
+            logging.info(f"上传后删除本地: {self.config.delete_local_after_upload}")
         logging.info("="*60)
         
         # 加载数据
@@ -393,22 +637,37 @@ class AnnualReportProcessor:
             logging.warning(f"未找到 {self.config.target_year} 年的数据")
             return
         
-        # 准备任务列表
         tasks = [
             (self.converter, row['公司代码'], row['公司简称'], row['年份'], row['年报链接'])
             for _, row in filtered_df.iterrows()
         ]
         
-        # 多进程处理
-        worker_count = self.config.processes or min(cpu_count(), len(tasks))
-        logging.info(f"使用 {worker_count} 个进程处理 {len(tasks)} 个文件")
+        if self.config.upload_to_gdrive:
+            if not self.config.gdrive_folder_id or not self.config.gdrive_credentials_path:
+                logging.error("上传到 Drive 已开启，但未配置 gdrive_folder_id 或 gdrive_credentials_path")
+                return
+            try:
+                service = _get_gdrive_service(
+                    self.config.gdrive_credentials_path,
+                    self.config.gdrive_token_path,
+                )
+                self.converter.set_drive_service(service, self.config.gdrive_folder_id)
+            except Exception as e:
+                logging.error(f"初始化 Google Drive 失败: {e}")
+                return
+            logging.info("使用单进程顺序处理（上传到 Drive）")
+            success_count = 0
+            for args in tasks:
+                if _process_task(args):
+                    success_count += 1
+        else:
+            worker_count = self.config.processes or min(cpu_count(), len(tasks))
+            logging.info(f"使用 {worker_count} 个进程处理 {len(tasks)} 个文件")
+            success_count = 0
+            with Pool(processes=worker_count) as pool:
+                results = pool.map(_process_task, tasks)
+                success_count = sum(results)
         
-        success_count = 0
-        with Pool(processes=worker_count) as pool:
-            results = pool.map(_process_task, tasks)
-            success_count = sum(results)
-        
-        # 输出统计
         logging.info("="*60)
         logging.info(f"处理完成: 成功 {success_count}/{len(tasks)}")
         logging.info("="*60)
@@ -439,6 +698,14 @@ if __name__ == '__main__':
     TIMEOUT = 15  # 请求超时（秒）
     PROCESSES = None  # 进程数（None表示自动）
     
+    # Google Drive（OAuth）：上传到共享文件夹，上传成功后删除本地以省空间
+    UPLOAD_TO_GDRIVE = True
+    DELETE_LOCAL_AFTER_UPLOAD = True
+    GDRIVE_FOLDER_ID = "1L2qkRqXhSmhTMc7pmPYICSnR2EOhsBA_"  # 目标文件夹 ID（Drive 地址栏 folders/ 后的那串）
+    GDRIVE_CREDENTIALS_PATH = "credentials.json"  # OAuth 客户端密钥 JSON
+    GDRIVE_TOKEN_PATH = "token.json"  # 首次授权后保存的 token
+    UPLOAD_RECORD_FILE = "uploaded_txt_records.txt"  # 本地上传记录（每行一个 txt 文件名）
+    
     # ==================== 执行逻辑 ====================
     
     if BATCH_MODE:
@@ -452,7 +719,13 @@ if __name__ == '__main__':
                 delete_pdf=DELETE_PDF,
                 max_retries=MAX_RETRIES,
                 timeout=TIMEOUT,
-                processes=PROCESSES
+                processes=PROCESSES,
+                upload_to_gdrive=UPLOAD_TO_GDRIVE,
+                delete_local_after_upload=DELETE_LOCAL_AFTER_UPLOAD,
+                gdrive_folder_id=GDRIVE_FOLDER_ID,
+                gdrive_credentials_path=GDRIVE_CREDENTIALS_PATH,
+                gdrive_token_path=GDRIVE_TOKEN_PATH,
+                upload_record_file=UPLOAD_RECORD_FILE,
             )
             
             processor = AnnualReportProcessor(config)
@@ -469,7 +742,13 @@ if __name__ == '__main__':
             delete_pdf=DELETE_PDF,
             max_retries=MAX_RETRIES,
             timeout=TIMEOUT,
-            processes=PROCESSES
+            processes=PROCESSES,
+            upload_to_gdrive=UPLOAD_TO_GDRIVE,
+            delete_local_after_upload=DELETE_LOCAL_AFTER_UPLOAD,
+            gdrive_folder_id=GDRIVE_FOLDER_ID,
+            gdrive_credentials_path=GDRIVE_CREDENTIALS_PATH,
+            gdrive_token_path=GDRIVE_TOKEN_PATH,
+            upload_record_file=UPLOAD_RECORD_FILE,
         )
         
         processor = AnnualReportProcessor(config)

@@ -38,6 +38,10 @@ data/
 # Notebooks checkpoints
 .ipynb_checkpoints/
 
+# Google Drive OAuth (do not commit)
+credentials.json
+token.json
+
 # Misc
 *.zip
 *.tar
