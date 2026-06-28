@@ -33,11 +33,24 @@ PROCESSES = None    # None = 自动（使用 CPU 核数）
 
 
 def _load_module(filename: str, module_name: str):
+    """Load a script by path; register in sys.modules for Windows multiprocessing spawn."""
+    if module_name in sys.modules:
+        return sys.modules[module_name]
     path = SCRIPT_DIR / filename
     spec = importlib.util.spec_from_file_location(module_name, path)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _register_spawn_modules() -> None:
+    """Pre-load modules whose functions are pickled into Pool workers (Windows spawn)."""
+    _load_module("2.pdf_batch_converter.py", "converter")
+
+
+# Spawned workers re-import __main__ before unpickling; register aliases at import time.
+_register_spawn_modules()
 
 
 def xlsx_path(year: int) -> Path:
