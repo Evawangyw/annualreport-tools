@@ -559,10 +559,19 @@ class PDFConverter:
 
 
 
+_worker_converter: Optional["PDFConverter"] = None
+
+
+def _init_worker(config: ConverterConfig) -> None:
+    """在每个 worker 进程中初始化 PDFConverter（Windows spawn 兼容）。"""
+    global _worker_converter
+    _worker_converter = PDFConverter(config)
+
+
 def _process_task(args: Tuple) -> bool:
     """多进程任务包装函数。"""
-    converter, code, name, year, pdf_url = args
-    return converter.process_single_file(code, name, year, pdf_url)
+    code, name, year, pdf_url = args
+    return _worker_converter.process_single_file(code, name, year, pdf_url)
 
 
 class AnnualReportProcessor:
@@ -638,7 +647,7 @@ class AnnualReportProcessor:
             return
         
         tasks = [
-            (self.converter, row['公司代码'], row['公司简称'], row['年份'], row['年报链接'])
+            (row['公司代码'], row['公司简称'], row['年份'], row['年报链接'])
             for _, row in filtered_df.iterrows()
         ]
         
@@ -651,11 +660,13 @@ class AnnualReportProcessor:
                     self.config.gdrive_credentials_path,
                     self.config.gdrive_token_path,
                 )
-                self.converter.set_drive_service(service, self.config.gdrive_folder_id)
             except Exception as e:
                 logging.error(f"初始化 Google Drive 失败: {e}")
                 return
             logging.info("使用单进程顺序处理（上传到 Drive）")
+            _init_worker(self.config)
+            self.converter = _worker_converter
+            self.converter.set_drive_service(service, self.config.gdrive_folder_id)
             success_count = 0
             for args in tasks:
                 if _process_task(args):
@@ -664,7 +675,11 @@ class AnnualReportProcessor:
             worker_count = self.config.processes or min(cpu_count(), len(tasks))
             logging.info(f"使用 {worker_count} 个进程处理 {len(tasks)} 个文件")
             success_count = 0
-            with Pool(processes=worker_count) as pool:
+            with Pool(
+                processes=worker_count,
+                initializer=_init_worker,
+                initargs=(self.config,),
+            ) as pool:
                 results = pool.map(_process_task, tasks)
                 success_count = sum(results)
         
